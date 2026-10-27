@@ -225,3 +225,7 @@ PID/授权码在 `main/tuya_config.h`；把 `tuya_config_secrets.h.example` 复�
   配网和 BLE DP 控制。
 - OTA 已开启（`main/ota_app.c` 回调注入 + 双分区表），但升级流程尚未真机验证。
 - `port_fs` / `port_ai_demo`（媒体）尚未适配，等 p2p/agent demo 需要时再加。
+
+---
+
+TuyaOpen-Core 官方仓库：<https://github.com/tuya/TuyaOpen-Core>

@@ -262,3 +262,7 @@ Paths are relative to the core repository (the downloaded copy lives under
   table) but the upgrade flow has not been validated on real hardware.
 - `port_fs` / `port_ai_demo` (media) are not adapted; add them when the
   p2p/agent demos need them.
+
+---
+
+Official TuyaOpen-Core repository: <https://github.com/tuya/TuyaOpen-Core>
