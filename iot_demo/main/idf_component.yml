@@ -1,0 +1,9 @@
+dependencies:
+  idf: ">=5.0"
+  tuya/tuyaopen-core:
+    git: https://github.com/tuya/TuyaOpen-Core.git
+    version: "84b2cbc6d3c2ab13b3261b21fa784b2fdacca807"
+  tuya/esp-idf:
+    git: https://github.com/tuya/TuyaOpen-Core.git
+    path: port/esp-idf
+    version: "84b2cbc6d3c2ab13b3261b21fa784b2fdacca807"

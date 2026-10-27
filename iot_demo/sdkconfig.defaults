@@ -1,0 +1,46 @@
+# TuyaOpen-Core switches (reachable via core's Kconfig.projbuild in the menuconfig TuyaOpen-Core menu)
+# Use esp-idf's mbedtls; do not build core's bundled copy (avoids symbol conflicts)
+CONFIG_ENABLE_PLATFORM_MBEDTLS=y
+CONFIG_LITTLE_END=y
+
+# Target and partitions
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# mbedtls capabilities required by tuya_tls
+CONFIG_MBEDTLS_THREADING_C=y
+CONFIG_MBEDTLS_THREADING_ALT=y
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
+# Symmetric 4 KiB in/out buffers, same as the upstream ESP32 port. The IDF
+# default is asymmetric (IN 16 KiB / OUT 4 KiB), which leaves
+# MBEDTLS_SSL_MAX_CONTENT_LEN undefined; core's tuya_tls.c then advertises
+# max_fragment_length=1024, the Tuya MQTT server fragments its ~2 KiB
+# certificate message across records, and mbedtls 3.x (no cross-record
+# handshake reassembly) fails with MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE
+# (-0x7080). Upstream's symmetric 4096 makes core advertise 4096.
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
+# CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN is not set
+
+# BLE: core's BLE switch (compiles iot-core/ble/*.c and the port's real BLE card)
+# plus the esp-idf bundled NimBLE host. Bluedroid is left off; the port talks to
+# the NimBLE host directly (see tuyaopen-core/port/esp-idf/src/port_bluetooth.c).
+CONFIG_ENABLE_BLUETOOTH=y
+CONFIG_BT_ENABLED=y
+# CONFIG_BT_BLUEDROID_ENABLED is not set
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_CTRL_HCI_MODE_VHCI=y
+# Peripheral (slave) only: the port has no central/observer entry points, so the
+# corresponding NimBLE roles are compiled out.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+# core's GATT characteristics carry up to 244 bytes; keep the NimBLE preferred
+# MTU at the upstream value (256) so a single notification fits without app-side
+# fragmentation.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
