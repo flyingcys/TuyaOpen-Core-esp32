@@ -1,0 +1,23 @@
+menu "TuyaOpen-Core IoT Demo Application"
+
+    config ESP32_DEFAULT
+        bool
+        default y
+        select ENABLE_BLUETOOTH
+
+    config PROJECT_VERSION
+        string "Project version"
+        default "1.0.0"
+        help
+            Version string compiled into the TuyaOpen-Core demo as PROJECT_VERSION and passed
+            to tuya_iot_init() as software_ver.
+
+            For an OTA upgrade this value must be higher than the version of
+            the firmware currently running on the device (for example
+            1.0.0 -> 1.0.1); otherwise the cloud will not offer the upgrade.
+
+            This is the application's own version. It is independent of
+            ESP-IDF's "Application manager -> Project version" (APP_PROJECT_VER),
+            which controls the version field of the application descriptor.
+
+endmenu
