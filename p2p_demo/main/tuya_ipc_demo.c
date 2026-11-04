@@ -402,7 +402,8 @@ static BOOL_T __demo_camera_present(void)
 static void __demo_register_variants(void)
 {
 #if defined(ESP_PLATFORM)
-    return; /* the ESP32 sample has no pre-encoded rate ladder */
+    /* demo_vcam_open_embedded registers the embedded 250/150/100 ladder. */
+    return;
 #else
     static const uint32_t rates[] = {500, 450, 350, 250};
     const char           *path     = __demo_h264_path();
@@ -487,7 +488,7 @@ static OPERATE_RET __demo_camera_request_i_frame(void)
 }
 
 /**
- * @brief Adjust the bitrate: the sample source has no encoder, so the bitrate cannot be changed
+ * @brief Switch to the pre-encoded variant closest to (not above) the requested rate
  */
 static OPERATE_RET __demo_camera_set_bitrate(uint32_t kbps)
 {
@@ -819,7 +820,7 @@ int demo_on_request_i_frame_callback(void)
 }
 
 /**
- * @brief App bitrate adjustment: the sample source cannot change the bitrate, so return -1
+ * @brief App bitrate request: switch to the highest pre-encoded variant not above it
  */
 int demo_on_set_video_bitrate_callback(uint32_t kbps)
 {

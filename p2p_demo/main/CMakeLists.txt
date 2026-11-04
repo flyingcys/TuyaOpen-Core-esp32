@@ -13,13 +13,13 @@ set(_demo_srcs
 idf_component_register(
     SRCS ${_demo_srcs}
     INCLUDE_DIRS "."
-    EMBED_FILES "demo_video.264"
+    EMBED_FILES "demo_video.264" "demo_video_150.264" "demo_video_100.264"
     REQUIRES nvs_flash tuyaopen-core esp-idf esp_wifi esp_netif esp_event esp_timer
 )
 unset(_demo_srcs)
 
-# Virtual camera / P2P AV parameters. The embedded sample is 320x240@10,
-# 250 kbps, GOP 10.
+# Virtual camera / P2P AV parameters. The embedded ladder is 320x240@10,
+# 250/150/100 kbps, GOP 10; the 250 kbps entry is the base.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     P2P_MEM_USE_PSRAM=1
     P2P_DEMO_WIDTH=320
@@ -28,6 +28,12 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     P2P_DEMO_KBPS=250
     P2P_DEMO_GOP=10
 )
+
+if(DEFINED DEMO_VCAM_FORCE_SWITCH_TEST AND DEMO_VCAM_FORCE_SWITCH_TEST)
+    # Bring-up only: force 250 -> 150 (10 s) -> 100 (20 s) to verify that the
+    # embedded ladder switches without a decoder reset or black screen.
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DEMO_VCAM_FORCE_SWITCH_TEST=1)
+endif()
 
 if(DEFINED CONFIG_PROJECT_VERSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE

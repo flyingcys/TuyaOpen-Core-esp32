@@ -1,12 +1,13 @@
 /**
  * @file demo_vcam.c
- * @brief ESP32 virtual camera: embedded Annex-B H.264 sample -> AU index ->
+ * @brief ESP32 virtual camera: embedded Annex-B H.264 ladder -> AU index ->
  *        cyclic frame feed at the configured frame rate.
  *
- * The ESP32 board has no camera in this demo. The sample is embedded with
- * IDF EMBED_FILES and indexed at open; the feed thread loops it forever.
- * There is no file I/O and no rate-variant ladder on this platform: the P2P
- * bitrate callback reports NOT_SUPPORTED and the core keeps its base rate.
+ * The ESP32 board has no camera in this demo. Three 320x240@10 samples
+ * (250/150/100 kbps) are embedded with IDF EMBED_FILES and indexed at open.
+ * demo_vcam_set_bitrate() switches the feed to the highest compatible variant
+ * not above the P2P rate-control request; all variants share one
+ * resolution/profile/fps/GOP and SPS/PPS, and the switch resumes on an IDR.
  *
  * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
  */
@@ -22,6 +23,12 @@
 #define DEMO_VCAM_THREAD_STACK   4096
 #define DEMO_VCAM_WAIT_SLICE_MS  10
 #define DEMO_VCAM_EXIT_WAIT_MS   2000
+#define DEMO_VCAM_VARIANT_MAX    3
+#define DEMO_VCAM_SWITCH_HOLD_MS 2000
+
+#ifndef DEMO_VCAM_FORCE_SWITCH_TEST
+#define DEMO_VCAM_FORCE_SWITCH_TEST 0
+#endif
 
 typedef struct {
     uint32_t offset;
@@ -29,17 +36,34 @@ typedef struct {
     BOOL_T   is_i;
 } DEMO_VCAM_AU_T;
 
-extern const uint8_t demo_video_264_start[] asm("_binary_demo_video_264_start");
-extern const uint8_t demo_video_264_end[] asm("_binary_demo_video_264_end");
-
-static struct {
+typedef struct {
     const uint8_t  *buf;
     uint32_t        buf_len;
     DEMO_VCAM_AU_T *aus;
     uint32_t        au_num;
     uint32_t        i_num;
+    uint32_t        kbps;
+    BOOL_T          compatible;
+} DEMO_VCAM_VARIANT_T;
+
+extern const uint8_t demo_video_264_start[] asm("_binary_demo_video_264_start");
+extern const uint8_t demo_video_264_end[] asm("_binary_demo_video_264_end");
+extern const uint8_t demo_video_150_264_start[] asm("_binary_demo_video_150_264_start");
+extern const uint8_t demo_video_150_264_end[] asm("_binary_demo_video_150_264_end");
+extern const uint8_t demo_video_100_264_start[] asm("_binary_demo_video_100_264_start");
+extern const uint8_t demo_video_100_264_end[] asm("_binary_demo_video_100_264_end");
+
+static struct {
+    DEMO_VCAM_VARIANT_T variants[DEMO_VCAM_VARIANT_MAX];
+    uint32_t        variant_num;
+    volatile int    active;
+    volatile int    pending; /* -1 = none */
+    uint64_t        last_switch_ms;
     uint32_t        fps;
     uint32_t        cur_kbps;
+    uint32_t        late_logs;
+    BOOL_T          force_150;
+    BOOL_T          force_100;
     DEMO_VCAM_FRAME_CB cb;
     THREAD_HANDLE   thread;
     volatile BOOL_T running;
@@ -155,23 +179,71 @@ static uint32_t __demo_vcam_index(const uint8_t *buf, uint32_t len, DEMO_VCAM_AU
     return count;
 }
 
-static uint32_t __demo_vcam_next_i(uint32_t cur)
+/**
+ * @brief Locate the first SPS and PPS in an Annex-B sample
+ *
+ * Variants may only be switched mid-stream when their SPS/PPS match; the
+ * decoder is not reset by the demo.
+ */
+static BOOL_T __demo_vcam_get_sps_pps(const uint8_t *buf, uint32_t len, const uint8_t **sps,
+                                      uint32_t *sps_len, const uint8_t **pps, uint32_t *pps_len)
+{
+    uint32_t sc_off = 0;
+    uint32_t sc_len = 0;
+
+    *sps     = NULL;
+    *sps_len = 0;
+    *pps     = NULL;
+    *pps_len = 0;
+    if (buf == NULL || len == 0 || !__demo_vcam_find_sc(buf, len, 0, &sc_off, &sc_len)) {
+        return FALSE;
+    }
+
+    while (1) {
+        uint32_t nal_off = sc_off + sc_len;
+        uint32_t next_off = 0;
+        uint32_t next_len = 0;
+        BOOL_T   has_next = __demo_vcam_find_sc(buf, len, nal_off, &next_off, &next_len);
+        uint32_t nal_end = has_next ? next_off : len;
+        uint8_t  nal_type = (nal_off < len) ? (buf[nal_off] & 0x1F) : 0;
+        uint32_t nal_len = (nal_end > nal_off) ? (nal_end - nal_off) : 0;
+
+        if (nal_type == 7 && *sps == NULL) {
+            *sps     = buf + nal_off;
+            *sps_len = nal_len;
+        } else if (nal_type == 8 && *pps == NULL) {
+            *pps     = buf + nal_off;
+            *pps_len = nal_len;
+        }
+        if (*sps != NULL && *pps != NULL) {
+            return TRUE;
+        }
+        if (!has_next) {
+            break;
+        }
+        sc_off = next_off;
+        sc_len = next_len;
+    }
+    return FALSE;
+}
+
+static uint32_t __demo_vcam_next_i(const DEMO_VCAM_VARIANT_T *v, uint32_t cur)
 {
     uint32_t i;
 
-    if (s_vcam.aus == NULL || s_vcam.au_num == 0) {
+    if (v == NULL || v->aus == NULL || v->au_num == 0) {
         return 0;
     }
-    if (cur >= s_vcam.au_num) {
-        cur = s_vcam.au_num - 1;
+    if (cur >= v->au_num) {
+        cur = v->au_num - 1;
     }
-    for (i = cur + 1; i < s_vcam.au_num; i++) {
-        if (s_vcam.aus[i].is_i) {
+    for (i = cur + 1; i < v->au_num; i++) {
+        if (v->aus[i].is_i) {
             return i;
         }
     }
     for (i = 0; i < cur; i++) {
-        if (s_vcam.aus[i].is_i) {
+        if (v->aus[i].is_i) {
             return i;
         }
     }
@@ -198,10 +270,25 @@ static void __demo_vcam_thread(void *args)
     while (!s_vcam.stop) {
         uint64_t due_ms;
         DEMO_VCAM_FRAME_T frame;
+        DEMO_VCAM_VARIANT_T *v;
 
+        if (s_vcam.pending >= 0) {
+            int p = s_vcam.pending;
+
+            s_vcam.pending = -1;
+            if (p >= 0 && p < (int)s_vcam.variant_num && s_vcam.variants[p].compatible &&
+                s_vcam.variants[p].aus != NULL && s_vcam.variants[p].au_num > 0) {
+                s_vcam.active   = p;
+                s_vcam.cur_kbps = s_vcam.variants[p].kbps;
+                idx = s_vcam.variants[p].aus[0].is_i ? 0 : __demo_vcam_next_i(&s_vcam.variants[p], 0);
+                PR_NOTICE("vcam switch: %ukbps, %u AU", s_vcam.variants[p].kbps, s_vcam.variants[p].au_num);
+            }
+        }
+
+        v = &s_vcam.variants[s_vcam.active];
         if (s_vcam.want_i_frame) {
             s_vcam.want_i_frame = FALSE;
-            idx = __demo_vcam_next_i(idx);
+            idx = __demo_vcam_next_i(v, idx);
             if (s_iframe_jumps < 8) {
                 s_iframe_jumps++;
                 PR_NOTICE("vcam I-frame jump: au=%u", idx);
@@ -224,27 +311,70 @@ static void __demo_vcam_thread(void *args)
             break;
         }
 
-        frame.data       = s_vcam.buf + s_vcam.aus[idx].offset;
-        frame.len        = s_vcam.aus[idx].len;
+        {
+            uint64_t late = core_system_get_millisecond() - due_ms;
+            if (late > 200 && s_vcam.late_logs < 5) {
+                s_vcam.late_logs++;
+                PR_WARN("vcam tick late: %ums (tick=%u)", (unsigned)late, (unsigned)tick);
+            }
+        }
+
+        frame.data       = v->buf + v->aus[idx].offset;
+        frame.len        = v->aus[idx].len;
         frame.ts_ms      = tick * 1000 / s_vcam.fps;
-        frame.is_i_frame = s_vcam.aus[idx].is_i;
+        frame.is_i_frame = v->aus[idx].is_i;
         if (s_vcam.cb) {
             s_vcam.cb(&frame);
         }
 
-        idx = (idx + 1) % s_vcam.au_num;
+        idx = (idx + 1) % v->au_num;
         tick++;
+
+#if DEMO_VCAM_FORCE_SWITCH_TEST
+        {
+            uint64_t elapsed_ms = core_system_get_millisecond() - start_ms;
+
+            if (!s_vcam.force_150 && elapsed_ms >= 10000) {
+                s_vcam.force_150 = TRUE;
+                PR_NOTICE("vcam force switch: 150kbps ret=%d", demo_vcam_set_bitrate(150));
+            } else if (!s_vcam.force_100 && elapsed_ms >= 20000) {
+                s_vcam.force_100 = TRUE;
+                PR_NOTICE("vcam force switch: 100kbps ret=%d", demo_vcam_set_bitrate(100));
+            }
+        }
+#endif
     }
 
     s_vcam.exited = TRUE;
 }
 
+typedef struct {
+    uint32_t        kbps;
+    const uint8_t  *start;
+    const uint8_t  *end;
+} DEMO_VCAM_EMBEDDED_T;
+
+/* Base first, then the fallbacks. The selection scan is order-independent,
+ * but the 250 kbps entry must stay first: it is the SPS/PPS reference and the
+ * rate the P2P AV info advertises. */
+static const DEMO_VCAM_EMBEDDED_T s_embedded[] = {
+    {250, demo_video_264_start, demo_video_264_end},
+    {150, demo_video_150_264_start, demo_video_150_264_end},
+    {100, demo_video_100_264_start, demo_video_100_264_end},
+};
+_Static_assert(sizeof(s_embedded) / sizeof(s_embedded[0]) <= DEMO_VCAM_VARIANT_MAX,
+               "DEMO_VCAM_VARIANT_MAX is smaller than the embedded ladder");
+
 OPERATE_RET demo_vcam_open_embedded(uint32_t fps, uint32_t kbps, DEMO_VCAM_FRAME_CB cb)
 {
-    uint32_t au_num;
-    uint32_t i_num = 0;
-    uint32_t i;
-    THREAD_CFG_T cfg;
+    const uint8_t *base_sps = NULL;
+    const uint8_t *base_pps = NULL;
+    uint32_t       base_sps_len = 0;
+    uint32_t       base_pps_len = 0;
+    uint32_t       n;
+    int            active = -1;
+    OPERATE_RET    ret = OPRT_MALLOC_FAILED;
+    THREAD_CFG_T   cfg;
 
     if (fps == 0 || cb == NULL) {
         return OPRT_INVALID_PARM;
@@ -257,35 +387,109 @@ OPERATE_RET demo_vcam_open_embedded(uint32_t fps, uint32_t kbps, DEMO_VCAM_FRAME
         return OPRT_COM_ERROR;
     }
 
-    s_vcam.buf     = demo_video_264_start;
-    s_vcam.buf_len = (uint32_t)(demo_video_264_end - demo_video_264_start);
+    memset(s_vcam.variants, 0, sizeof(s_vcam.variants));
+    s_vcam.variant_num    = 0;
+    s_vcam.pending        = -1;
+    s_vcam.last_switch_ms = 0;
 
-    au_num = __demo_vcam_index(s_vcam.buf, s_vcam.buf_len, NULL, 0);
-    if (au_num == 0) {
-        PR_ERR("vcam: embedded sample has no AU");
-        return OPRT_INVALID_PARM;
+    for (n = 0; n < sizeof(s_embedded) / sizeof(s_embedded[0]) && n < DEMO_VCAM_VARIANT_MAX; n++) {
+        DEMO_VCAM_VARIANT_T *v = &s_vcam.variants[s_vcam.variant_num];
+        uint32_t             au_num;
+        uint32_t             i_num = 0;
+        uint32_t             i;
+
+        v->kbps    = s_embedded[n].kbps;
+        v->buf     = s_embedded[n].start;
+        v->buf_len = (uint32_t)(s_embedded[n].end - s_embedded[n].start);
+        au_num     = __demo_vcam_index(v->buf, v->buf_len, NULL, 0);
+        if (au_num == 0) {
+            PR_ERR("vcam: embedded %ukbps sample has no AU", v->kbps);
+            ret = OPRT_INVALID_PARM;
+            goto fail;
+        }
+        v->aus = (DEMO_VCAM_AU_T *)core_malloc(au_num * sizeof(DEMO_VCAM_AU_T));
+        if (v->aus == NULL) {
+            goto fail;
+        }
+        (void)__demo_vcam_index(v->buf, v->buf_len, v->aus, au_num);
+        for (i = 0; i < au_num; i++) {
+            if (v->aus[i].is_i) {
+                i_num++;
+            }
+        }
+        v->au_num     = au_num;
+        v->i_num      = i_num;
+        v->compatible = TRUE;
+        s_vcam.variant_num++;
+        PR_DEBUG("vcam variant: %ukbps, %u bytes, %u AU, %u I", v->kbps, v->buf_len, au_num, i_num);
     }
-    s_vcam.aus = (DEMO_VCAM_AU_T *)core_malloc(au_num * sizeof(DEMO_VCAM_AU_T));
-    if (s_vcam.aus == NULL) {
-        return OPRT_MALLOC_FAILED;
+    if (s_vcam.variant_num == 0) {
+        PR_ERR("vcam: embedded ladder is empty");
+        goto fail;
     }
-    (void)__demo_vcam_index(s_vcam.buf, s_vcam.buf_len, s_vcam.aus, au_num);
-    for (i = 0; i < au_num; i++) {
-        if (s_vcam.aus[i].is_i) {
-            i_num++;
+
+    /* All variants must share the base SPS/PPS or the decoder sees a new
+     * stream at every switch. */
+    if (__demo_vcam_get_sps_pps(s_vcam.variants[0].buf, s_vcam.variants[0].buf_len, &base_sps,
+                                &base_sps_len, &base_pps, &base_pps_len)) {
+        for (n = 1; n < s_vcam.variant_num; n++) {
+            const uint8_t *sps = NULL;
+            const uint8_t *pps = NULL;
+            uint32_t       sps_len = 0;
+            uint32_t       pps_len = 0;
+
+            if (!__demo_vcam_get_sps_pps(s_vcam.variants[n].buf, s_vcam.variants[n].buf_len, &sps, &sps_len,
+                                         &pps, &pps_len) ||
+                sps_len != base_sps_len || pps_len != base_pps_len ||
+                memcmp(sps, base_sps, sps_len) != 0 || memcmp(pps, base_pps, pps_len) != 0) {
+                s_vcam.variants[n].compatible = FALSE;
+                PR_ERR("vcam variant %ukbps SPS/PPS differs; disabled", s_vcam.variants[n].kbps);
+            }
+        }
+    } else {
+        PR_ERR("vcam base sample has no SPS/PPS; only the base variant is usable");
+        for (n = 1; n < s_vcam.variant_num; n++) {
+            s_vcam.variants[n].compatible = FALSE;
         }
     }
 
-    s_vcam.au_num      = au_num;
-    s_vcam.i_num       = i_num;
-    s_vcam.fps         = fps;
-    s_vcam.cur_kbps    = kbps;
-    s_vcam.cb          = cb;
-    s_vcam.stop        = FALSE;
-    s_vcam.started     = FALSE;
-    s_vcam.exited      = FALSE;
+    for (n = 0; n < s_vcam.variant_num; n++) {
+        if (!s_vcam.variants[n].compatible) {
+            continue;
+        }
+        if (s_vcam.variants[n].kbps <= kbps &&
+            (active < 0 || s_vcam.variants[n].kbps > s_vcam.variants[active].kbps)) {
+            active = (int)n;
+        }
+    }
+    if (active < 0) {
+        for (n = 0; n < s_vcam.variant_num; n++) {
+            if (!s_vcam.variants[n].compatible) {
+                continue;
+            }
+            if (active < 0 || s_vcam.variants[n].kbps < s_vcam.variants[active].kbps) {
+                active = (int)n;
+            }
+        }
+    }
+    if (active < 0) {
+        PR_ERR("vcam: no compatible variant");
+        ret = OPRT_NOT_SUPPORTED;
+        goto fail;
+    }
+
+    s_vcam.active       = active;
+    s_vcam.cur_kbps     = s_vcam.variants[active].kbps;
+    s_vcam.fps          = fps;
+    s_vcam.late_logs    = 0;
+    s_vcam.force_150    = FALSE;
+    s_vcam.force_100    = FALSE;
+    s_vcam.cb           = cb;
+    s_vcam.stop         = FALSE;
+    s_vcam.started      = FALSE;
+    s_vcam.exited       = FALSE;
     s_vcam.want_i_frame = FALSE;
-    s_vcam.running     = TRUE;
+    s_vcam.running      = TRUE;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.stackDepth = DEMO_VCAM_THREAD_STACK;
@@ -295,14 +499,24 @@ OPERATE_RET demo_vcam_open_embedded(uint32_t fps, uint32_t kbps, DEMO_VCAM_FRAME
     cfg.psram_mode = 1;
     if (core_thread_create_and_start(&s_vcam.thread, NULL, NULL, __demo_vcam_thread, NULL, &cfg) != OPRT_OK) {
         s_vcam.running = FALSE;
-        core_free(s_vcam.aus);
-        s_vcam.aus = NULL;
-        return OPRT_COM_ERROR;
+        ret = OPRT_COM_ERROR;
+        goto fail;
     }
 
-    PR_NOTICE("vcam open: embedded %u bytes, %u AU, %u I-frame, %ufps, %ukbps",
-              s_vcam.buf_len, au_num, i_num, fps, kbps);
+    PR_NOTICE("vcam open: %u variants, active %ukbps, %ufps", s_vcam.variant_num, s_vcam.cur_kbps, fps);
     return OPRT_OK;
+
+fail:
+    for (n = 0; n < DEMO_VCAM_VARIANT_MAX; n++) {
+        if (s_vcam.variants[n].aus != NULL) {
+            core_free(s_vcam.variants[n].aus);
+            s_vcam.variants[n].aus = NULL;
+        }
+    }
+    s_vcam.variant_num = 0;
+    s_vcam.active      = 0;
+    s_vcam.cur_kbps    = 0;
+    return ret;
 }
 
 OPERATE_RET demo_vcam_open(const char *path, uint32_t fps, uint32_t kbps, DEMO_VCAM_FRAME_CB cb)
@@ -344,15 +558,17 @@ OPERATE_RET demo_vcam_close(void)
         }
     }
 
-    core_free(s_vcam.aus);
-    s_vcam.aus     = NULL;
-    s_vcam.au_num  = 0;
-    s_vcam.i_num   = 0;
-    s_vcam.buf     = NULL;
-    s_vcam.buf_len = 0;
-    s_vcam.cb      = NULL;
-    s_vcam.fps     = 0;
-    s_vcam.cur_kbps = 0;
+    for (uint32_t i = 0; i < DEMO_VCAM_VARIANT_MAX; i++) {
+        core_free(s_vcam.variants[i].aus);
+        memset(&s_vcam.variants[i], 0, sizeof(s_vcam.variants[i]));
+    }
+    s_vcam.variant_num    = 0;
+    s_vcam.active         = 0;
+    s_vcam.pending        = -1;
+    s_vcam.last_switch_ms = 0;
+    s_vcam.cb             = NULL;
+    s_vcam.fps            = 0;
+    s_vcam.cur_kbps       = 0;
     PR_NOTICE("vcam close");
     return OPRT_OK;
 }
@@ -368,15 +584,73 @@ OPERATE_RET demo_vcam_request_i_frame(void)
 
 OPERATE_RET demo_vcam_add_variant(uint32_t kbps, const char *path)
 {
-    (void)kbps;
-    (void)path;
+    uint32_t i;
+
+    (void)path; /* embedded ladder: the path only documents the asset */
+    if (kbps == 0) {
+        return OPRT_INVALID_PARM;
+    }
+    for (i = 0; i < sizeof(s_embedded) / sizeof(s_embedded[0]); i++) {
+        if (s_embedded[i].kbps == kbps) {
+            return OPRT_OK;
+        }
+    }
     return OPRT_NOT_SUPPORTED;
 }
 
 OPERATE_RET demo_vcam_set_bitrate(uint32_t kbps)
 {
-    (void)kbps;
-    return OPRT_NOT_SUPPORTED;
+    int      best = -1;
+    uint32_t i;
+    uint64_t now;
+
+    if (!s_vcam.running) {
+        return OPRT_COM_ERROR;
+    }
+    if (s_vcam.variant_num == 0) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    /* One switch at a time. While a switch or its hold-down is pending the
+     * core keeps its current rate and retries next window. */
+    if (s_vcam.pending >= 0) {
+        return OPRT_RESOURCE_NOT_READY;
+    }
+    now = core_system_get_millisecond();
+    if (s_vcam.last_switch_ms != 0 && now - s_vcam.last_switch_ms < DEMO_VCAM_SWITCH_HOLD_MS) {
+        return OPRT_RESOURCE_NOT_READY;
+    }
+
+    for (i = 0; i < s_vcam.variant_num; i++) {
+        if (!s_vcam.variants[i].compatible) {
+            continue;
+        }
+        if (s_vcam.variants[i].kbps <= kbps &&
+            (best < 0 || s_vcam.variants[i].kbps > s_vcam.variants[best].kbps)) {
+            best = (int)i;
+        }
+    }
+    if (best < 0) {
+        for (i = 0; i < s_vcam.variant_num; i++) {
+            if (!s_vcam.variants[i].compatible) {
+                continue;
+            }
+            if (best < 0 || s_vcam.variants[i].kbps < s_vcam.variants[best].kbps) {
+                best = (int)i;
+            }
+        }
+    }
+    if (best < 0 || s_vcam.variants[best].kbps > kbps) {
+        PR_DEBUG("vcam set bitrate: %ukbps below lowest usable variant", kbps);
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (best == s_vcam.active) {
+        return OPRT_OK;
+    }
+
+    s_vcam.pending        = best;
+    s_vcam.last_switch_ms = now;
+    PR_DEBUG("vcam set bitrate: request %ukbps -> %ukbps", kbps, s_vcam.variants[best].kbps);
+    return OPRT_OK;
 }
 
 BOOL_T demo_vcam_is_open(void)
@@ -386,28 +660,33 @@ BOOL_T demo_vcam_is_open(void)
 
 OPERATE_RET demo_vcam_get_stats(uint32_t *au_num, uint32_t *i_num, uint32_t *max_len, BOOL_T *first_is_i)
 {
+    const DEMO_VCAM_VARIANT_T *v;
     uint32_t i;
     uint32_t maxl = 0;
 
     if (!s_vcam.running) {
         return OPRT_COM_ERROR;
     }
-    for (i = 0; i < s_vcam.au_num; i++) {
-        if (s_vcam.aus[i].len > maxl) {
-            maxl = s_vcam.aus[i].len;
+    v = &s_vcam.variants[s_vcam.active];
+    if (v->aus == NULL || v->au_num == 0) {
+        return OPRT_COM_ERROR;
+    }
+    for (i = 0; i < v->au_num; i++) {
+        if (v->aus[i].len > maxl) {
+            maxl = v->aus[i].len;
         }
     }
     if (au_num) {
-        *au_num = s_vcam.au_num;
+        *au_num = v->au_num;
     }
     if (i_num) {
-        *i_num = s_vcam.i_num;
+        *i_num = v->i_num;
     }
     if (max_len) {
         *max_len = maxl;
     }
     if (first_is_i) {
-        *first_is_i = s_vcam.au_num ? s_vcam.aus[0].is_i : FALSE;
+        *first_is_i = v->au_num ? v->aus[0].is_i : FALSE;
     }
     return OPRT_OK;
 }
