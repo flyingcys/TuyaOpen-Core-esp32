@@ -119,7 +119,9 @@ static BOOL_T            s_cam_running = FALSE;
 static uint64_t          s_live_start_ms = 0;
 static BOOL_T            s_first_enq_logged = FALSE;
 static BOOL_T            s_first_get_logged = FALSE;
+static BOOL_T            s_first_getfail_logged = FALSE;
 static uint32_t          s_pre_enq_drops = 0;
+static uint64_t          s_last_get_ok_ms = 0;
 
 #if DEMO_HAS_RING_BUFFER
 static RING_BUFFER_USER_HANDLE_T s_ring_w = NULL;
@@ -688,6 +690,8 @@ int demo_on_live_video_start_callback(void)
     s_live_start_ms = tuya_p2p_misc_get_current_time_ms();
     s_first_enq_logged = FALSE;
     s_first_get_logged = FALSE;
+    s_first_getfail_logged = FALSE;
+    s_last_get_ok_ms = s_live_start_ms;
     s_pre_enq_drops = 0;
 
     if (s_frame_mutex != NULL) {
@@ -781,12 +785,22 @@ int demo_on_get_video_frame_callback(MEDIA_FRAME *media_frame)
 #endif
 
     core_mutex_lock(s_frame_mutex);
+    uint32_t qc;
     rt = __demo_p2p_queue_pop(media_frame);
+    qc = s_q_count;
     core_mutex_unlock(s_frame_mutex);
     if (rt != OPRT_OK) {
+        uint64_t now_ms = tuya_p2p_misc_get_current_time_ms();
+
+        if (!s_first_getfail_logged && s_live_push_enable && now_ms - s_last_get_ok_ms > 500) {
+            s_first_getfail_logged = TRUE;
+            PR_WARN("live get: no frame after +%ums (queue=%u pre_drops=%u)",
+                    (unsigned)(now_ms - s_last_get_ok_ms), (unsigned)qc, (unsigned)s_pre_enq_drops);
+        }
         core_system_sleep(10);
         return -1;
     }
+    s_last_get_ok_ms = tuya_p2p_misc_get_current_time_ms();
     if (!s_first_get_logged) {
         s_first_get_logged = TRUE;
         PR_NOTICE("live first fetch: +%ums key=%d size=%u",
