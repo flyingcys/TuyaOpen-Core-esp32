@@ -2,6 +2,9 @@
 set(_demo_srcs
     "main.c"
     "tuya_main.c"
+    "tuya_ipc_demo.c"
+    "demo_vcam.c"
+    "demo_media_event.c"
     "wifi_sta.c"
     "reset_netcfg.c"
     "ota_app.c"
@@ -10,9 +13,21 @@ set(_demo_srcs
 idf_component_register(
     SRCS ${_demo_srcs}
     INCLUDE_DIRS "."
+    EMBED_FILES "demo_video.264"
     REQUIRES nvs_flash tuyaopen-core esp-idf esp_wifi esp_netif esp_event esp_timer
 )
 unset(_demo_srcs)
+
+# Virtual camera / P2P AV parameters. The embedded sample is 320x240@10,
+# 250 kbps, GOP 10.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    P2P_MEM_USE_PSRAM=1
+    P2P_DEMO_WIDTH=320
+    P2P_DEMO_HEIGHT=240
+    P2P_DEMO_FPS=10
+    P2P_DEMO_KBPS=250
+    P2P_DEMO_GOP=10
+)
 
 if(DEFINED CONFIG_PROJECT_VERSION)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE

@@ -26,6 +26,9 @@
 
 #include "cJSON.h"
 #include "sdkconfig.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "core_api.h"
 #include "core_event.h"
 #include "core_event_info.h"
@@ -36,6 +39,8 @@
 #include "tuya_iot.h"
 #include "tuya_iot_dp.h"
 #include "tuya_lan.h"
+#include "tuya_p2p_sdk.h"
+#include "tuya_ipc_demo.h"
 #include "ble_mgr.h"
 #include "ble_netcfg.h"
 #include <assert.h>
@@ -61,6 +66,10 @@ tuya_iot_client_t client;
 
 /* Tuya license information (uuid authkey) */
 tuya_iot_license_t license;
+
+/* P2P media thread: started once after MQTT connects */
+static THREAD_HANDLE hIpcDemoHandle = NULL;
+static void          tuya_ipc_demo_thread(void *arg);
 
 /**
  * @brief user defined log output api, in this demo, it will use uart0 as log-tx
@@ -128,7 +137,19 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
      * channel (the BLE stack stays up for BLE DP control) */
     case TUYA_EVENT_MQTT_CONNECTED:
         ble_netcfg_stop();
+        if (hIpcDemoHandle == NULL) {
+            THREAD_CFG_T thrd_param = {0};
+            thrd_param.stackDepth   = 1024 * 8;
+            thrd_param.priority     = THREAD_PRIO_1;
+            thrd_param.thrdname     = "tuya_ipc_demo_thread";
+            core_thread_create_and_start(&hIpcDemoHandle, NULL, NULL, tuya_ipc_demo_thread, NULL, &thrd_param);
+        }
         break;
+    /* Cloud MQTT downlink RTC signaling -> P2P */
+    case TUYA_EVENT_RTC_REQ: {
+        cJSON *root_json = event->value.asJSON;
+        gw_p2p_mqtt_data_cb(root_json);
+    } break;
     /* RECV upgrade request */
     case TUYA_EVENT_UPGRADE_NOTIFY:
         user_upgrade_notify_on(client, event->value.asJSON);
@@ -413,6 +434,10 @@ void user_main(void)
     license.uuid    = TUYA_OPENSDK_UUID;
     license.authkey = TUYA_OPENSDK_AUTHKEY;
     // PR_DEBUG("uuid %s, authkey %s", license.uuid, license.authkey);
+
+    /* P2P activation parameters (skill list) must be assembled before tuya_iot_init */
+    OnIotInited();
+
     /* Initialize Tuya device configuration */
     rt = tuya_iot_init(&client, &(const tuya_iot_config_t){
                                     .software_ver  = PROJECT_VERSION,
@@ -421,6 +446,7 @@ void user_main(void)
                                     .authkey       = license.authkey,
                                     .event_handler = user_event_handler_on,
                                     .network_check = user_network_check,
+                                    .skill_param   = gw_active_get_ext_param(),
                                 });
     assert(rt == OPRT_OK);
 
@@ -447,6 +473,28 @@ void user_main(void)
         /* Loop to receive packets, and handles client keepalive */
         tuya_iot_yield(&client);
     }
+}
+
+/**
+ * @brief P2P media thread: fill the TUYA_IPC_SDK_VAR_S callbacks and start the media chain
+ */
+static void tuya_ipc_demo_thread(void *arg)
+{
+    TUYA_IPC_SDK_VAR_S sdkVar = {0};
+
+    (void)arg;
+    sdkVar.OnGetVideoFrameCallback     = demo_on_get_video_frame_callback;
+    sdkVar.OnGetAudioFrameCallback     = demo_on_get_audio_frame_callback;
+    sdkVar.OnSignalDisconnectCallback  = demo_on_signal_disconnect_callback;
+    sdkVar.OnLiveVideoStartCallback    = demo_on_live_video_start_callback;
+    sdkVar.OnLiveVideoStopCallback     = demo_on_live_video_stop_callback;
+    sdkVar.OnLiveAudioStartCallback    = demo_on_live_audio_start_callback;
+    sdkVar.OnLiveAudioStopCallback     = demo_on_live_audio_stop_callback;
+    sdkVar.OnRecvAudioFrameCallback    = demo_on_recv_audio_frame_callback;
+    sdkVar.OnRequestIFrameCallback     = demo_on_request_i_frame_callback;
+    sdkVar.OnSetVideoBitrateCallback   = demo_on_set_video_bitrate_callback;
+    TUYA_APP_Start(&sdkVar);
+    tuya_ipc_demo_start();
 }
 
 /**
@@ -481,22 +529,41 @@ static void tuya_app_thread(void *arg)
 }
 
 /**
+ * @brief Periodic heap diagnostic: internal SRAM is the scarce resource on
+ * this board (WiFi/BLE/TLS/P2P threads). Log free/largest internal blocks and
+ * the DMA pool so P2P failures can be tied to a specific stage.
+ */
+static void __heap_monitor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        PR_NOTICE("heap: int=%u largest=%u dma=%u psram=%u",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/**
  * @brief ESP32 entry point (called by app_main in main.c): creates a dedicated
  * thread to run user_main, avoiding the main task's default stack
  * (CONFIG_ESP_MAIN_TASK_STACK_SIZE)
  *
- * The stack size is 8KB: user_main runs the tuya_iot_yield state machine on
- * the same thread, including the MQTT loop (tuya_mqtt_loop); the TLS handshake
- * and packet decryption during connection setup also run on this stack -- an
- * mbedtls handshake peaks at several KB, so 4KB is too tight (esp-idf's
- * xTaskCreate counts the stack in bytes; the port adds another 1KB for s3).
+ * The stack size is 24KB: user_main runs the tuya_iot_yield state machine on
+ * the same thread, including the MQTT loop and P2P signaling; the TLS
+ * handshake and packet decryption during connection setup also run here.
  */
 void tuya_app_main(void)
 {
     THREAD_CFG_T thrd_param = {0};
-    thrd_param.stackDepth   = 1024 * 8;
+    thrd_param.stackDepth   = 1024 * 24;
     thrd_param.priority     = THREAD_PRIO_1;
     thrd_param.thrdname     = "tuya_app_main";
+    if (xTaskCreate(__heap_monitor_task, "heap_mon", 2816, NULL, 1, NULL) != pdPASS) {
+        PR_ERR("heap monitor task create failed");
+    }
     core_thread_create_and_start(&ty_app_thread, NULL, NULL, tuya_app_thread, NULL, &thrd_param);
 }
 #endif
